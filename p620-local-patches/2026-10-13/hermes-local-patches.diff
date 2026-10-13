@@ -1,0 +1,1291 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 411134b41a..d0d05d161f 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -653,7 +653,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
+         return False
+     try:
+         from tools.bot_mode_probe import (
+-            BOT_CHAT_TITLE,
++            session_has_bot_mode,
++            session_title_for,
+             stored_bot_chat_prompt_needs_upgrade,
+             stored_prompt_capability_stale,
+         )
+@@ -667,13 +668,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
+             return True
+         if not getattr(agent, "_bot_mode_protocol", True):
+             return False
+-        title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+-        if not title and agent._session_db and agent.session_id:
+-            try:
+-                title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
+-            except Exception:
+-                title = ""
+-        return title == BOT_CHAT_TITLE and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
++        return session_has_bot_mode(session_title_for(agent), home) and bool(
++            stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+     except Exception:
+         return False
+ 
+@@ -769,7 +765,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
+                 "adopt the new capability surface (one-time prefix-cache break).",
+                 agent.session_id,
+             )
+-            agent._session_title_hint = "Bot Chat"
++            # Stamp the gate hint from the session's OWN stored title when there is one: a
++            # declared handoff session keeps its own title (it is not a canonical Bot Chat).
++            # With no readable title the hint is left alone — manufacturing "Bot Chat" here
++            # would turn "cannot tell" into canonical eligibility.
++            try:
++                stored_title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
++            except Exception:
++                stored_title = ""
++            if stored_title:
++                agent._session_title_hint = stored_title
+             # The skills index cache (LRU + disk snapshot) does not watch the skills
+             # dir; a capability refresh must rebuild THROUGH it or new skills are lost.
+             try:
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index a2ef790d4b..858b8ba004 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -342,18 +342,17 @@ def _auto_load_parts(agent: Any) -> list[str]:
+ 
+ 
+ def _bot_mode_parts(agent: Any) -> list[str]:
+-    """Bot Mode teammate protocol — only in a bot's canonical "Bot Chat" session.
++    """Bot Mode teammate protocol — in a bot's canonical "Bot Chat" session, or in a
++    session this profile declared as a handoff session (``agent.bot_mode_handoff_titles``).
+     Marks the prompt timeless (the volatile date line is dropped) since a birth
+     date pinned in a months-long session is misinformation."""
+     parts: list[str] = []
+     try:
+-        from tools.bot_mode_probe import BOT_CHAT_TITLE, epoch_line, get_bot_mode_protocol_section
+-        _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+-        if not _title:
+-            _sdb = getattr(agent, "_session_db", None)
+-            _sid = getattr(agent, "session_id", None)
+-            _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
+-        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
++        from tools.bot_mode_probe import (
++            epoch_line, get_bot_mode_protocol_section, session_has_bot_mode, session_title_for,
++        )
++        _title = session_title_for(agent)
++        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if session_has_bot_mode(_title, _agent_home(agent)) else None
+         if _bot_section:
+             parts.append(_bot_section)
+             # Capability epoch lets the restore path rebuild ONCE per
+diff --git a/agent/turn_scripted_prelude.py b/agent/turn_scripted_prelude.py
+index 24052457ae..8f031355d7 100644
+--- a/agent/turn_scripted_prelude.py
++++ b/agent/turn_scripted_prelude.py
+@@ -21,7 +21,7 @@ from agent.message_sanitization import deterministic_call_id
+ from agent.transports.types import NormalizedResponse, build_tool_call
+ from agent.turn_tool_round import run_tool_round
+ 
+-Prelude = Generator[tuple[str, str, dict], Optional[str]]
++Prelude = Generator[tuple[str, str, dict], Optional[str], None]
+ 
+ 
+ def run_scripted_prelude(agent: Any, s: Any, prelude: Prelude) -> Any:
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 4466b5a1ad..72572ee19c 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -154,6 +154,49 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
+     return notify_metadata
+ 
+ 
++# Raven-conditional (candidate Freshfield Raven adapter contract): the metadata key the
++# reviewed Raven adapter records on its admitted event (``_build_event``) and re-requires
++# on the final send. Read here only; never written for any other platform.
++RAVEN_SOURCE_REVISION_METADATA_KEY = "raven_source_revision"
++
++
++def _raven_source_metadata_for_event(event) -> dict | None:
++    """The admitted Raven turn's server-owned source identity for the final send, or None.
++
++    The reviewed Raven adapter binds its ONE per-turn reply capability to the admitted
++    event object and refuses every final send whose metadata does not explicitly carry
++    the matching ``source_message_id`` / ``source_revision`` / ``source_requester``
++    triple. The values are read off the SAME event the Raven adapter built from the
++    trusted resolver when it admitted the message: ``event.message_id`` (the admitted
++    message id), ``source.user_id`` (the verified requester) and the
++    ``raven_source_revision`` event metadata the adapter recorded.
++
++    Strictly Raven-scoped and fail-closed: any other platform — or a Raven event
++    missing any field — returns ``None``, so the send metadata stays byte-identical
++    to the previous behaviour on every other platform.
++    """
++    source = getattr(event, "source", None)
++    if _platform_name(getattr(source, "platform", None)) != "raven":
++        return None
++    metadata = getattr(event, "metadata", None)
++    revision = metadata.get(RAVEN_SOURCE_REVISION_METADATA_KEY) if isinstance(metadata, dict) else None
++    message_id = getattr(event, "message_id", None)
++    requester = getattr(source, "user_id", None)
++    # Relay verbatim, but only real values: a blank/missing/non-string field adds
++    # nothing so the send stays exactly as fail-closed as before.
++    if not (isinstance(message_id, str) and message_id.strip()):
++        return None
++    if not (isinstance(revision, str) and revision.strip()):
++        return None
++    if not (isinstance(requester, str) and requester.strip()):
++        return None
++    return {
++        "source_message_id": message_id,
++        "source_revision": revision,
++        "source_requester": requester,
++    }
++
++
+ def _reply_anchor_for_event(event) -> str | None:
+     """Return reply_to id for platforms that need reply semantics."""
+     override = getattr(event, "reply_anchor_override", None)
+@@ -854,7 +897,7 @@ _ROOT_CREDENTIAL_PATHS = (
+     "sessions", "browser-profile", *_sqlite_files("state.db"), *_sqlite_files("kanban.db"))
+ 
+ 
+-def _profile_cache_roots() -> list[Path]:
++def _profile_cache_roots() -> List[Path]:
+     """Per-profile cache roots ``<root>/profiles/<name>/cache/{images,...}`` (the static safe
+     roots cover only the active HERMES_HOME). Enumerated at check time so profiles created after
+     startup count and are allowlisted BEFORE the ``/root`` denylist (HERMES_HOME symlinked).
+@@ -867,7 +910,7 @@ def _profile_cache_roots() -> list[Path]:
+     return [p / "cache" / subdir for p in _profile_dirs() for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
+ 
+ 
+-def _profile_dirs() -> list[Path]:
++def _profile_dirs() -> List[Path]:
+     """Every ``<root>/profiles/<name>`` directory, read at check time."""
+     try:
+         return [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
+@@ -875,7 +918,7 @@ def _profile_dirs() -> list[Path]:
+         return []
+ 
+ 
+-def _credential_home_roots() -> list[Path]:
++def _credential_home_roots() -> List[Path]:
+     """Every Hermes home whose credential stores the denylist must cover: the ACTIVE home
+     (the per-turn HERMES_HOME override under ``gateway.multiplex_profiles``), the shared root
+     and every ``<root>/profiles/*``. Enumerated at check time like ``_profile_cache_roots`` on
+@@ -889,7 +932,7 @@ def _kanban_root() -> Path:
+     return Path(os.environ.get("HERMES_KANBAN_HOME", "").strip() or _HERMES_ROOT).expanduser()
+ 
+ 
+-def _kanban_board_dirs() -> list[Path]:
++def _kanban_board_dirs() -> List[Path]:
+     """Every directory under ``<root>/kanban/boards`` (lax on purpose: the DENY side must catch a
+     board whatever its name; the allow side filters further)."""
+     with contextlib.suppress(OSError):
+@@ -897,7 +940,7 @@ def _kanban_board_dirs() -> list[Path]:
+     return []
+ 
+ 
+-def _kanban_attachment_roots() -> list[Path]:
++def _kanban_attachment_roots() -> List[Path]:
+     """Return durable Kanban attachment roots without importing kanban_db."""
+     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
+     if override:
+@@ -909,7 +952,7 @@ def _kanban_attachment_roots() -> list[Path]:
+     return roots
+ 
+ 
+-def _media_delivery_allowed_roots() -> list[Path]:
++def _media_delivery_allowed_roots() -> List[Path]:
+     """Return roots from which model-emitted local media may be delivered."""
+     from gateway.media_policy import media_delivery_allow_dirs
+     operator_roots = (
+@@ -930,13 +973,13 @@ def _media_delivery_recency_seconds() -> float:
+     return _or_default(lambda: max(0.0, float(custom)) if custom else default, default)
+ 
+ 
+-def _kanban_board_db_paths() -> list[Path]:
++def _kanban_board_db_paths() -> List[Path]:
+     """Named-board ``kanban.db`` stores (+ sidecars): they sit beside the ATTACHMENTS dir
+     ``_kanban_attachment_roots`` allowlists and hold every task, comment and run transcript."""
+     return [board / name for board in _kanban_board_dirs() for name in _sqlite_files("kanban.db")]
+ 
+ 
+-def _media_delivery_denied_paths() -> list[Path]:
++def _media_delivery_denied_paths() -> List[Path]:
+     """Return absolute denylist paths under which delivery is never allowed."""
+     home = Path(os.path.expanduser("~"))
+     return [*map(Path, _MEDIA_DELIVERY_DENIED_PREFIXES),
+@@ -999,7 +1042,7 @@ def _tenv(name: str, default: str = "") -> str:
+     return terminal_env(name, default)
+ 
+ 
+-def _parse_docker_volume_mounts() -> list[tuple[Path, Path]]:
++def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+     """Parse ``TERMINAL_DOCKER_VOLUMES`` (JSON list of ``host:container[:mode]``) into
+     ``(host_path, container_path)``; named volumes / non-absolute hosts can't resolve here."""
+     raw = _tenv("TERMINAL_DOCKER_VOLUMES", "").strip()
+@@ -1008,7 +1051,7 @@ def _parse_docker_volume_mounts() -> list[tuple[Path, Path]]:
+         parsed = _json.loads(raw) if raw else []
+     except Exception:
+         return []
+-    mounts: list[tuple[Path, Path]] = []
++    mounts: List[Tuple[Path, Path]] = []
+     for entry in parsed if isinstance(parsed, list) else ():
+         spec = entry.strip() if isinstance(entry, str) else ""
+         # Prefer the first ':/' so absolute container paths are unambiguous.
+@@ -1026,7 +1069,7 @@ def _parse_docker_volume_mounts() -> list[tuple[Path, Path]]:
+     return mounts
+ 
+ 
+-def _docker_sandbox_dir_candidates(session_key: str = "") -> list[str]:
++def _docker_sandbox_dir_candidates(session_key: str = "") -> List[str]:
+     """Candidate host sandbox dir names for the delivering session, best first. Mirrors
+     ``_resolve_container_task_id`` (tools/terminal_tool.py): containers are PROFILE-scoped
+     (``default``, else ``profile:<name>``); legacy ``session:<key>`` sandboxes stay as a fallback.
+@@ -1045,7 +1088,7 @@ def _docker_sandbox_dir_candidates(session_key: str = "") -> list[str]:
+         profile = get_active_profile_name() or "default"
+     except Exception:
+         profile = "default"
+-    candidates: list[str] = []
++    candidates: List[str] = []
+     # Explicit trusted-profiles opt-in: one shared container identity.
+     if shared := _tenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip():
+         candidates.append(sanitize_task_id_for_path(f"shared:{shared}"))
+@@ -1069,7 +1112,7 @@ def _docker_persistent_active() -> bool:
+     return _docker_env_active() and _tenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() in _TRUTHY
+ 
+ 
+-def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> list[Path]:
++def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> List[Path]:
+     """Existing ``<sandbox>/docker/<candidate>/<leaf>`` host dirs in candidate order;
+     the translator tries each until the file resolves. Empty unless Docker + persistent."""
+     if not _docker_persistent_active():
+@@ -1083,7 +1126,7 @@ def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> list[Path]:
+         return []
+ 
+ 
+-def _default_docker_workspace_host_roots(session_key: str = "") -> list[Path]:
++def _default_docker_workspace_host_roots(session_key: str = "") -> List[Path]:
+     """Existing host candidates for ``/workspace``: the explicit cwd mount
+     (``TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE``) if set, else the persistent sandbox layouts."""
+     if not _docker_persistent_active():
+@@ -1098,7 +1141,7 @@ def _default_docker_workspace_host_roots(session_key: str = "") -> list[Path]:
+     return _docker_persistent_sandbox_roots(session_key, "workspace")
+ 
+ 
+-def _cache_dir_container_mounts() -> list[tuple[Path, Path]]:
++def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+     """(host, container) pairs for the auto-mounted Hermes cache dirs (``/root/.hermes/...`` in
+     MEDIA tags); longer prefixes than the ``/root`` home mount, so longest-prefix match wins."""
+     if not _docker_env_active():
+@@ -1215,7 +1258,7 @@ def _log_safe_path(path: str) -> str:
+ 
+ 
+ def _validated_delivery_path(raw_path, session_key: str, label: str,
+-                             dropped: Optional[list[dict]] = None) -> Optional[str]:
++                             dropped: Optional[List[dict]] = None) -> Optional[str]:
+     """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
+     host cannot see is retried against the active remote sandbox (ssh/modal/...; #466). When
+     ``dropped`` is a list, a rejected path is appended as ``{"path", "reason"}`` so the caller can
+@@ -1286,7 +1329,7 @@ SUPPORTED_IMAGE_DOCUMENT_TYPES = {
+ # images (inline), video (inline where supported), audio (voice/audio), documents/spreadsheets/presentations
+ # (send_document), archives, and rendered web output. The dispatch partition (image vs video vs document)
+ # lives in ``gateway/run.py``. ---------------------------------------------------------------------------
+-MEDIA_DELIVERY_EXTS: tuple[str, ...] = (
++MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
+     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",  # images (embed inline)
+     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp",  # video (embed inline where supported)
+     ".mp3", ".m2a", ".wav", ".ogg", ".opus", ".m4a", ".flac",  # audio (voice/audio where supported)
+@@ -1362,7 +1405,7 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
+     re.IGNORECASE)
+ 
+ 
+-def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[tuple[str, int]]:
++def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
+     """Extensionless MEDIA tag match -> validated on-disk ``(safe_path, end_offset)`` or None: the
+     captured path first, then extended across single spaces (max 8 tokens, never past a newline
+     or the next ``MEDIA:``).
+@@ -1566,7 +1609,7 @@ class CachedMedia:
+ 
+ # MIME -> extension reverse lookup; FIRST match across image, video, document tables wins
+ # (built in reverse so the earliest extension is the one that survives).
+-_MIME_TO_EXT: dict[str, str] = {
++_MIME_TO_EXT: Dict[str, str] = {
+     mime: ext
+     for table in (SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES)
+     for ext, mime in reversed(table.items())}
+@@ -1688,14 +1731,14 @@ class ExecApprovalPrompt:
+     chat_id: str
+     session_key: str
+     text: str
+-    actions: list[tuple[str, str, str]]
++    actions: List[Tuple[str, str, str]]
+     command: str
+     description: str
+     smart_denied: bool
+-    metadata: Optional[dict[str, Any]] = None
++    metadata: Optional[Dict[str, Any]] = None
+ 
+     @property
+-    def choices(self) -> list[str]:
++    def choices(self) -> List[str]:
+         return [choice for _, choice, _ in self.actions]
+ 
+ 
+@@ -1752,7 +1795,7 @@ def _any_in(blob: str, *needles: str) -> bool:
+ 
+ 
+ # Ordered (kind, predicate) table for classify_send_error — first match wins.
+-_SEND_ERROR_CLASSIFIERS: tuple[tuple[str, Callable[[str], bool]], ...] = (
++_SEND_ERROR_CLASSIFIERS: Tuple[Tuple[str, Callable[[str], bool]], ...] = (
+     ("too_long", lambda b: _any_in(b, "message_too_long", "too long", "message is too long")),
+     ("bad_format", lambda b: (
+         _any_in(b, "can't parse entities", "cant parse entities", "can't find end", "unsupported start tag")
+@@ -1800,7 +1843,7 @@ class EphemeralReply(str):
+         return str.__str__(self)
+ 
+ 
+-def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
++def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
+                                 event: MessageEvent, *, merge_text: bool = False) -> None:
+     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
+     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
+@@ -1813,10 +1856,10 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
+         both_photo = existing_is_photo and incoming_is_photo
+         incoming_has_media = bool(event.media_urls)
+ 
+-        def _padded_inline_flags(msg: MessageEvent) -> list[Optional[bool]]:
++        def _padded_inline_flags(msg: MessageEvent) -> List[Optional[bool]]:
+             flags = list(getattr(msg, "media_text_inlined", []) or [])
+             return flags + [None] * (len(msg.media_urls) - len(flags))
+-        incoming_inline_flags: list[Optional[bool]] = []
++        incoming_inline_flags: List[Optional[bool]] = []
+         if incoming_has_media:
+             existing.media_text_inlined = _padded_inline_flags(existing)
+             incoming_inline_flags = _padded_inline_flags(event)
+@@ -1895,7 +1938,7 @@ def resolve_channel_skills(
+     return None
+ 
+ 
+-def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
++def _split_post_delivery_entry(entry: Any) -> Tuple[Optional[int], Any]:
+     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
+     generation."""
+     return entry if isinstance(entry, tuple) and len(entry) == 2 else (None, entry)
+@@ -1968,9 +2011,9 @@ class BasePlatformAdapter(ABC):
+         self.platform = platform
+         self._message_handler: Optional[MessageHandler] = None
+         self._no_message_handler_logged: bool = False
+-        self._reaction_handler: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
++        self._reaction_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
+-        self._platform_event_handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]] = None
++        self._platform_event_handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = None
+         # Rewrites ``event.source.thread_id`` before session keying (Telegram DM topics).
+         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+         self._running, self._fatal_error_retryable = False, True
+@@ -1986,14 +2029,14 @@ class BasePlatformAdapter(ABC):
+         self._platform_lock_takeover_allowed = self._platform_lock_takeover_attempted = False
+         # Per-session interrupt Event + owner Task: without the owner map an old task's finally
+         # could drop a newer guard.
+-        self._active_sessions: dict[str, asyncio.Event] = {}
+-        self._pending_messages: dict[str, MessageEvent] = {}
++        self._active_sessions: Dict[str, asyncio.Event] = {}
++        self._pending_messages: Dict[str, MessageEvent] = {}
+         # Consecutive in-band drains per session of the just-dispatched event bouncing straight
+         # back into the queue (session busy elsewhere); drives the drain back-off (#123229).
+-        self._requeue_counts: dict[str, int] = {}
+-        self._pending_text_batches: dict[str, MessageEvent] = {}
+-        self._pending_text_batch_tasks: dict[str, asyncio.Task] = {}
+-        self._session_tasks: dict[str, asyncio.Task] = {}
++        self._requeue_counts: Dict[str, int] = {}
++        self._pending_text_batches: Dict[str, MessageEvent] = {}
++        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
++        self._session_tasks: Dict[str, asyncio.Task] = {}
+         # Busy-text policy is a per-profile config decision the runner installs after construction
+         # (``_wire_adapter_handlers``); a constructor-time process-env read would freeze the launch
+         # profile's values into every profile's adapter under multiplexing (#116893). Defaults here
+@@ -2009,7 +2052,7 @@ class BasePlatformAdapter(ABC):
+         self._background_tasks: set[asyncio.Task] = set()
+         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
+         # callback)`` so a stale run can't clear a fresher run's callback.
+-        self._post_delivery_callbacks: dict[str, Any] = {}
++        self._post_delivery_callbacks: Dict[str, Any] = {}
+         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+         # Owning multiplex profile (None on primary); see _session_key_profile.
+@@ -2030,7 +2073,7 @@ class BasePlatformAdapter(ABC):
+         # Chats whose typing indicator is paused (approval waits); _keep_typing skips them.
+         self._typing_paused: set = set()
+         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
+-        self._status_text: dict[str, str] = {}
++        self._status_text: Dict[str, str] = {}
+ 
+     @property
+     def message_len_fn(self) -> Callable[[str], int]:
+@@ -2068,14 +2111,14 @@ class BasePlatformAdapter(ABC):
+         return False
+ 
+     def supports_draft_streaming(
+-        self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
++        self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+         chat_id: Optional[str] = None) -> bool:
+         """Whether native streaming-draft updates (``send_draft``) work for this chat type;
+         ``chat_id`` lets the relay adapter answer per negotiated capabilities. Consumers
+         fall back to ``send`` + ``edit_message`` when False or ``send_draft`` raises."""
+         return False
+ 
+-    def prefers_fresh_final_streaming(self, content: str, metadata: Optional[dict[str, Any]] = None) -> bool:
++    def prefers_fresh_final_streaming(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+         """Whether the stream consumer should finalize with a *fresh* final message (best-effort
+         deleting the preview) instead of final-editing it (Telegram: keeps rich rendering)."""
+         return False
+@@ -2087,7 +2130,7 @@ class BasePlatformAdapter(ABC):
+         return None
+ 
+     async def send_draft(self, chat_id: str, draft_id: int, content: str,
+-                         metadata: Optional[dict[str, Any]] = None) -> SendResult:
++                         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send or update an animated streaming-draft preview. Reuse one non-zero ``draft_id``
+         across a response so the platform animates (different responses need different ids). Drafts
+         have no message_id (no edit/reply/delete) — the final answer goes out as a regular ``send``.
+@@ -2361,7 +2404,7 @@ class BasePlatformAdapter(ABC):
+         self._message_handler = handler
+ 
+     def set_platform_event_handler(
+-        self, handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]]) -> None:
++        self, handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]]) -> None:
+         """Install the gateway-owned normalized platform-event boundary (stable dicts + internal
+         ``SessionSource``); the runner owns authorization and plugin dispatch: no callback = fail
+         closed."""
+@@ -2396,7 +2439,7 @@ class BasePlatformAdapter(ABC):
+         """Set an optional handler for messages arriving during active sessions."""
+         self._busy_session_handler = handler
+ 
+-    def set_reaction_handler(self, handler: Optional[Callable[[dict[str, Any]], Awaitable[None]]]) -> None:
++    def set_reaction_handler(self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]) -> None:
+         """Set the handler for platform-native emoji-reaction events: a normalised dict
+         (``platform``, ``event_name`` "reaction:added"/"reaction:removed", ``reaction``,
+         ``user_id``, ``item_user_id``, ``channel_id``, ``message_ts``, ``event_ts``, ``raw_event``)
+@@ -2418,7 +2461,7 @@ class BasePlatformAdapter(ABC):
+         non-boolean is "unknown", never an authorization that gates a credentialed side effect."""
+         if not user_id or self._authorization_check is None:
+             return None
+-        extra: dict[str, Any] = {}
++        extra: Dict[str, Any] = {}
+         if is_bot:
+             extra["is_bot"] = True
+         if thread_id is not None:
+@@ -2733,7 +2776,7 @@ class BasePlatformAdapter(ABC):
+ 
+     @abstractmethod
+     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
+-                   metadata: Optional[dict[str, Any]] = None) -> SendResult:
++                   metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send ``content`` (may be markdown) to a chat; returns SendResult with message id."""
+ 
+     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
+@@ -2799,15 +2842,15 @@ class BasePlatformAdapter(ABC):
+     _EA_REASON_BUDGET: int = 0  # 0 = the reason is never truncated
+ 
+     @property
+-    def _EA_HEADER(self) -> str:
++    def _EA_HEADER(self) -> str:  # noqa: N802 — adapter-override contract name
+         return f"⚠️ {ea_header_text()}\n\n"
+ 
+     @property
+-    def _EA_REASON_LABEL(self) -> str:
++    def _EA_REASON_LABEL(self) -> str:  # noqa: N802
+         return f"{ea_reason_label_text()}: "
+ 
+     @property
+-    def _EA_SMART_DENY_LINE(self) -> str:
++    def _EA_SMART_DENY_LINE(self) -> str:  # noqa: N802
+         return f"\n\n{ea_smart_deny_line_text()}"
+ 
+     @staticmethod
+@@ -2866,14 +2909,14 @@ class BasePlatformAdapter(ABC):
+ 
+     # ── Exec-approval prompt (template method). The choice set is one rule for every button
+     # surface — three separate "same fix × N adapters" commits motivated lifting it here.
+-    _EA_ACTION_STYLES: dict[str, str] = {"once": "primary", "deny": "danger"}
++    _EA_ACTION_STYLES: Dict[str, str] = {"once": "primary", "deny": "danger"}
+ 
+     @property
+-    def _EA_ACTION_LABELS(self) -> dict[str, str]:
++    def _EA_ACTION_LABELS(self) -> Dict[str, str]:  # noqa: N802 — adapter-override contract name
+         return ea_action_labels()
+ 
+     def _exec_approval_actions(
+-            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> list[tuple[str, str, str]]:
++            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> List[Tuple[str, str, str]]:
+         """``(label, choice, style)`` rows for the approval buttons. A smart deny is an owner
+         override for one operation only, so it offers neither the session nor the permanent tier;
+         the permanent tier is never offered without the session tier."""
+@@ -2893,7 +2936,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_exec_approval(
+         self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
+-        metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
++        metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
+         smart_denied: bool = False,
+     ) -> SendResult:
+         """Interactive exec-approval prompt; a press resolves via
+@@ -2914,7 +2957,7 @@ class BasePlatformAdapter(ABC):
+         return SendResult(success=False, error="Not supported")
+ 
+     @staticmethod
+-    def _format_choice_page(options: list, page: int, per_page: int) -> "tuple[list, dict[str, Any]]":
++    def _format_choice_page(options: list, page: int, per_page: int) -> "tuple[list, Dict[str, Any]]":
+         """Shared picker pagination: clamp ``page``, slice ``options`` -> ``(page_options, meta)``
+         with ``page``/``total_pages``/``start``/``end``/``total``/``page_info`` (`` (N–M of T)``,
+         empty for one page)."""
+@@ -2923,13 +2966,13 @@ class BasePlatformAdapter(ABC):
+         page = max(0, min(page, total_pages - 1))
+         start, end = page * per_page, min(page * per_page + per_page, total)
+         page_info = t("gateway.picker.page_info", start=start + 1, end=end, total=total) if total_pages > 1 else ""
+-        meta: dict[str, Any] = {"page": page, "total_pages": total_pages, "start": start,
++        meta: Dict[str, Any] = {"page": page, "total_pages": total_pages, "start": start,
+                    "end": end, "total": total, "page_info": page_info}
+         return options[start:end], meta
+ 
+     async def send_slash_confirm(
+         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
+-        metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Three-option slash-command confirmation (e.g. ``/reload-mcp``). Button adapters render
+         Approve Once / Always Approve / Cancel and MUST resolve via
+         ``GatewayRunner._resolve_slash_confirm(confirm_id, "once"|"always"|"cancel")``. Default (not
+@@ -2939,7 +2982,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_clarify(
+         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+-        session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Clarify prompt; button-capable adapters SHOULD override. Multiple choice (``choices``):
+         one button per choice plus "Other"; callbacks MUST resolve via
+         ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, response)``, "Other" calls
+@@ -2969,7 +3012,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_private_notice(
+         self, chat_id: str, user_id: Optional[str], content: str, reply_to: Optional[str] = None,
+-        metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send a notice privately when the platform supports it; default is a normal send."""
+         return await self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
+ 
+@@ -3001,8 +3044,8 @@ class BasePlatformAdapter(ABC):
+         await self.stop_typing(chat_id)
+ 
+     async def send_multiple_images(
+-        self, chat_id: str, images: list[tuple[str, str]],
+-        metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
++        self, chat_id: str, images: List[Tuple[str, str]],
++        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
+         """Send ``(url, alt)`` images (``http(s)://`` or ``file://``) one by one (GIFs via
+         ``send_animation``, local files via ``send_image_file``); override to bundle natively
+         (Signal). Returns success when at least one image was delivered — the outcome
+@@ -3038,14 +3081,14 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_image(
+         self, chat_id: str, image_url: str, caption: Optional[str] = None,
+-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send an image natively; default falls back to sending the URL as text."""
+         text = f"{caption}\n{image_url}" if caption else image_url
+         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+ 
+     async def send_animation(
+         self, chat_id: str, animation_url: str, caption: Optional[str] = None,
+-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send a GIF as a native animation (auto-plays inline); default falls back to
+         send_image."""
+         return await self.send_image(
+@@ -3057,7 +3100,7 @@ class BasePlatformAdapter(ABC):
+         return url.lower().split('?')[0].endswith('.gif')
+ 
+     @staticmethod
+-    def extract_images(content: str) -> tuple[list[tuple[str, str]], str]:
++    def extract_images(content: str) -> Tuple[List[Tuple[str, str]], str]:
+         """Extract ``![alt](url)`` and ``<img src=...>`` image URLs from a response;
+         returns ``([(url, alt_text), ...], content with those tags removed)``."""
+         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
+@@ -3085,7 +3128,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_voice(
+         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
++        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+         """Send audio as a native voice message (Telegram bubble / Discord attachment).
+         Default: friendly failure notice."""
+         return await self._send_media_fallback_notice(
+@@ -3093,7 +3136,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def _send_media_fallback_notice(
+         self, method: str, kind: str, path: str, chat_id: str, caption: Optional[str],
+-        reply_to: Optional[str], metadata: Optional[dict[str, Any]], *, file_name: Optional[str] = None,
++        reply_to: Optional[str], metadata: Optional[Dict[str, Any]], *, file_name: Optional[str] = None,
+     ) -> SendResult:
+         """Shared default for send_voice/send_video/send_document/send_image_file. The local path is
+         logged but NEVER echoed into chat (host layout leak); only the caller's ``file_name`` is
+@@ -3179,7 +3222,7 @@ class BasePlatformAdapter(ABC):
+         return False
+ 
+     async def begin_streaming_tts(
+-        self, chat_id: str, audio_format: AudioFormat, metadata: Optional[dict[str, Any]] = None,
++        self, chat_id: str, audio_format: AudioFormat, metadata: Optional[Dict[str, Any]] = None,
+     ) -> Optional[StreamingTTSHandle]:
+         """Open a streaming-audio session; returns an opaque handle for the
+         write/finish/abort calls, or ``None`` to decline (whole-file fallback)."""
+@@ -3209,21 +3252,21 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_video(
+         self, chat_id: str, video_path: str, caption: Optional[str] = None,
+-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
++        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+         """Send a video natively (inline playable). Default: friendly failure notice."""
+         return await self._send_media_fallback_notice(
+             "send_video", "video", video_path, chat_id, caption, reply_to, metadata)
+ 
+     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
+-                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
++                            metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+         """Send a document/file natively. Default: friendly failure notice."""
+         return await self._send_media_fallback_notice(
+             "send_document", "file", file_path, chat_id, caption, reply_to, metadata, file_name=file_name)
+ 
+     async def _notify_media_delivery_failure(
+         self, chat_id: str, media_path: str, *, is_voice: bool = False,
+-        metadata: Optional[dict[str, Any]] = None) -> None:
++        metadata: Optional[Dict[str, Any]] = None) -> None:
+         """User-visible notice when a MEDIA attachment upload failed: the tag was
+         already stripped from the text, so silence would be a silent drop.
+ 
+@@ -3248,7 +3291,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def send_image_file(
+         self, chat_id: str, image_path: str, caption: Optional[str] = None,
+-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
++        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+         """Send a local image file natively (send_image takes a URL). Default: friendly notice."""
+         return await self._send_media_fallback_notice(
+             "send_image_file", "image", image_path, chat_id, caption, reply_to, metadata)
+@@ -3260,14 +3303,14 @@ class BasePlatformAdapter(ABC):
+ 
+     @staticmethod
+     def filter_media_delivery_paths(media_files, session_key: str = "",
+-                                    dropped: Optional[list[dict]] = None) -> list[tuple[str, bool]]:
++                                    dropped: Optional[List[dict]] = None) -> List[Tuple[str, bool]]:
+         """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
+         return [
+             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
+             if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
+ 
+     @staticmethod
+-    def filter_local_delivery_paths(file_paths, session_key: str = "") -> list[str]:
++    def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
+         """Drop unsafe bare local file paths and normalize accepted paths."""
+         safe_paths = (_validated_delivery_path(p, session_key, "local file path") for p in file_paths or [])
+         return [p for p in safe_paths if p]
+@@ -3316,7 +3359,7 @@ class BasePlatformAdapter(ABC):
+         return _blank_spans(content, spans)
+ 
+     @staticmethod
+-    def extract_media(content: str) -> tuple[list[tuple[str, bool]], str]:
++    def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
+         """Extract ``MEDIA:<path>`` tags and strip ``[[audio_as_voice]]`` / ``[[as_document]]`` ->
+         ``([(path, is_voice), ...], cleaned)``. Both directives are message-global;
+         ``[[as_document]]`` (unmodified sendDocument for large images) is detected by dispatch sites
+@@ -3366,7 +3409,7 @@ class BasePlatformAdapter(ABC):
+         return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
+ 
+     @staticmethod
+-    def extract_local_files(content: str) -> tuple[list[str], str]:
++    def extract_local_files(content: str) -> Tuple[List[str], str]:
+         """Bare local file paths (absolute, ``~/`` or drive-letter) with deliverable extensions ->
+         ``(expanded_paths, cleaned_text)``. Candidates must exist on disk (URLs / hallucinated paths
+         ignored); paths inside fenced or inline code are skipped so code samples are never
+@@ -3585,7 +3628,7 @@ class BasePlatformAdapter(ABC):
+         lowered = (error or "").lower()
+         return any(pat in lowered for pat in ("timed out", "readtimeout", "writetimeout"))
+ 
+-    def _unwrap_ephemeral(self, response: Any) -> tuple[Optional[str], int]:
++    def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
+         """Unwrap a str/None/:class:`EphemeralReply` response into ``(text, ttl)``. ``ttl > 0``
+         means schedule ``_schedule_ephemeral_delete`` after a successful send; forced to 0 when the
+         adapter doesn't override ``delete_message`` so non-supporting platforms degrade to normal
+@@ -4196,11 +4239,11 @@ class BasePlatformAdapter(ABC):
+         lo, hi = bounds
+         return random.uniform(lo / 1000.0, hi / 1000.0)
+ 
+-    async def _synthesize_auto_tts(self, text_content: str) -> tuple[list[str], Optional[str]]:
++    async def _synthesize_auto_tts(self, text_content: str) -> Tuple[List[str], Optional[str]]:
+         """Synthesize auto-TTS audio -> ``(existing_paths, requested_path)``; empty/None on failure
+         (logged, never raised). Path built platform-aware HERE: HERMES_SESSION_PLATFORM is cleared
+         post-handler."""
+-        paths: list[str] = []
++        paths: List[str] = []
+         requested_path = None
+         try:
+             from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+@@ -4231,7 +4274,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def _play_tts_file(
+         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
+-        metadata: dict[str, Any], record_delivery: Callable) -> bool:
++        metadata: Dict[str, Any], record_delivery: Callable) -> bool:
+         """Play one synthesized TTS file. Returns True when the ORIGINAL reply text rode
+         along as a Telegram caption (first file, ≤1024 chars) so the text send is skipped."""
+         caption = None
+@@ -4309,7 +4352,7 @@ class BasePlatformAdapter(ABC):
+ 
+     async def _deliver_media_attachments(
+         self, event: MessageEvent, media_files: list, local_files: list, *,
+-        force_document_attachments: bool, human_delay: float, metadata: dict[str, Any],
++        force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
+         record_delivery: Callable) -> None:
+         """Deliver MEDIA-tag files and detected local files by type: images batched via
+         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
+@@ -4361,7 +4404,7 @@ class BasePlatformAdapter(ABC):
+                     logger.error("[%s] Error sending local file %s: %s", self.name, path, err)
+ 
+     async def _send_image_batch(
+-        self, event: MessageEvent, images: list, metadata: dict[str, Any], human_delay: float,
++        self, event: MessageEvent, images: list, metadata: Dict[str, Any], human_delay: float,
+         record_delivery: Callable) -> None:
+         """Batch-send images; a failure is logged (never raised) so other attachments still go.
+         The batch result feeds ``record_delivery`` so media-only turns report their real
+@@ -4376,7 +4419,7 @@ class BasePlatformAdapter(ABC):
+         record_delivery(result)
+ 
+     async def send_final_ledgered(
+-        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
++        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
+         reply_to: Optional[str], is_ephemeral_response: bool = False,
+     ) -> "tuple[SendResult, BasePlatformAdapter]":
+         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
+@@ -4408,7 +4451,7 @@ class BasePlatformAdapter(ABC):
+             await self.gateway_runner._clear_durable_active_turn(event)
+ 
+     async def _send_final_text(
+-        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
++        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
+         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
+         result, delivery_adapter = await self.send_final_ledgered(
+@@ -4441,7 +4484,7 @@ class BasePlatformAdapter(ABC):
+         return _thread_metadata
+ 
+     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
+-                                   metadata: dict[str, Any], *, anything_sent: bool,
++                                   metadata: Dict[str, Any], *, anything_sent: bool,
+                                    record_delivery: Callable) -> None:
+         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
+         then fail loudly if a non-empty response produced nothing deliverable. Attachment
+@@ -4468,7 +4511,7 @@ class BasePlatformAdapter(ABC):
+         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
+         if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
+             return None
+-        kwargs: dict[str, Any] = {"metadata": metadata}
++        kwargs: Dict[str, Any] = {"metadata": metadata}
+         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
+             kwargs["stop_event"] = interrupt_event
+         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
+@@ -4598,6 +4641,13 @@ class BasePlatformAdapter(ABC):
+                 text_content, media_files = extracted.text_content, extracted.media_files
+                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
+                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
++                # Raven-conditional: carry the admitted turn's (source_message_id,
++                # source_revision, source_requester) on the final send so the reviewed
++                # Raven adapter can bind its per-turn reply capability. Every other
++                # platform (and a Raven event missing a field) stays byte-identical.
++                _raven_source_metadata = _raven_source_metadata_for_event(event)
++                if _raven_source_metadata:
++                    _final_thread_metadata.update(_raven_source_metadata)
+                 _tts_paths, _tts_requested_path = [], None
+                 if self._wants_auto_tts(
+                         event, session_key, interrupt_event, text_content, media_files):
+@@ -4855,11 +4905,11 @@ class BasePlatformAdapter(ABC):
+         return source
+ 
+     @abstractmethod
+-    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
++    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+         """Get information about a chat/channel; dict with at least ``name``
+         and ``type`` ("dm", "group", "channel")."""
+ 
+-    def toolsets_for_source(self, source: "SessionSource") -> Optional[list[str]]:
++    def toolsets_for_source(self, source: "SessionSource") -> Optional[List[str]]:
+         """Per-source toolset override REPLACING ``platform_toolsets.<platform>``, or None
+         (default); validated via ``_get_platform_tools`` (webhook adapter pins per-route)."""
+         return None
+@@ -4871,7 +4921,7 @@ class BasePlatformAdapter(ABC):
+ 
+     @staticmethod
+     def truncate_message(content: str, max_length: int = 4096,
+-                         len_fn: Optional["Callable[[str], int]"] = None) -> list[str]:
++                         len_fn: Optional["Callable[[str], int]"] = None) -> List[str]:
+         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
+         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
+         ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
+@@ -4880,7 +4930,7 @@ class BasePlatformAdapter(ABC):
+             return [content]
+         INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+         FENCE_CLOSE = "\n```"
+-        chunks: list[str] = []
++        chunks: List[str] = []
+         remaining = content
+         carry_lang: Optional[str] = None  # language tag ("" ok) when previous chunk ended mid-fence
+         while remaining:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 12ff515740..55b291a61f 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -192,6 +192,10 @@ DEFAULT_CONFIG = {
+         "environment_probe": True,
+         # Bot Mode teammate-messaging protocol section (silent unless desktop Bot Mode manages it).
+         "bot_mode_protocol": True,
++        # Session titles of THIS profile (beyond the canonical "Bot Chat") that carry the
++        # teammate-messaging surface: they can call ``message_agent`` and receive a local
++        # delivery. Profile-scoped and opt-in; empty means canonical-only, as before.
++        "bot_mode_handoff_titles": [],
+         # Embedder-supplied text appended to the system prompt's environment-hints block, so a host
+         # wrapping Hermes (sandbox runner, managed platform) can describe proxy/credential/ mount
+         # layout without editing SOUL.md. Env HERMES_ENVIRONMENT_HINT overrides it.
+diff --git a/tools/bot_live_delivery.py b/tools/bot_live_delivery.py
+index 2fac2a9c18..a0082a632e 100644
+--- a/tools/bot_live_delivery.py
++++ b/tools/bot_live_delivery.py
+@@ -29,9 +29,12 @@ _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
+ _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
+ 
+ 
+-def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
+-    """Return the exact Bot Chat tip's lease, including unsupported CLI owners."""
+-    from hermes_cli.active_sessions import active_session_registry_snapshot
++def session_id_for_title(profile_home: Path | str, title: str) -> str | None:
++    """The session id behind an EXACT title — its compression tip — or None.
++
++    Exact, deliberately: ``resolve_session_by_title`` prefers a ``"<title> #N"`` sibling
++    for non-canonical titles, so using it for a declared handoff session could deliver a
++    teammate's message into a different chat that merely shares a name prefix."""
+     from hermes_state import SessionDB
+ 
+     home = Path(profile_home).resolve()
+@@ -39,10 +42,20 @@ def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
+         return None
+     db = SessionDB(db_path=home / "state.db", read_only=True)
+     try:
+-        row = db.get_session_by_title("Bot Chat")
+-        session_id = db.get_compression_tip(row["id"]) if row else None
++        row = db.get_session_by_title(title)
++        return db.get_compression_tip(row["id"]) if row else None
+     finally:
+         db.close()
++
++
++def find_owner_by_title(profile_home: Path | str, title: str) -> dict[str, Any] | None:
++    """Return the lease of the session titled ``title`` (its compression tip), including
++    unsupported CLI owners. ``title`` is the canonical Bot Chat or a session the profile
++    declared as a handoff session (``agent.bot_mode_handoff_titles``)."""
++    from hermes_cli.active_sessions import active_session_registry_snapshot
++
++    home = Path(profile_home).resolve()
++    session_id = session_id_for_title(home, title)
+     if not session_id:
+         return None
+     for entry in active_session_registry_snapshot(registry_home=home):
+@@ -51,9 +64,9 @@ def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
+     return None
+ 
+ 
+-def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
++def find_live_owner(profile_home: Path | str, title: str) -> dict[str, Any] | None:
+     """Only advertised consumers may receive owner-pinned mailbox deliveries."""
+-    entry = find_canonical_owner(profile_home)
++    entry = find_owner_by_title(profile_home, title)
+     meta = (entry or {}).get("metadata") or {}
+     if entry and meta.get("bot_live_delivery_consumer") is True and meta.get("live_session_id"):
+         return {key: entry[key] for key in ("profile_home", "session_id", "lease_id")} | {
+@@ -61,6 +74,49 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
+     return None
+ 
+ 
++def declared_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
++    """The advertised live owner of this profile's DECLARED handoff session, if any.
++
++    ``profile_home`` may be a profile directory or a bare home; the declaration is read
++    from that profile's own config (``agent.bot_mode_handoff_titles``)."""
++    from tools.bot_mode_probe import BOT_CHAT_TITLE, delivery_session_title
++
++    title = delivery_session_title(profile_home)
++    return None if title == BOT_CHAT_TITLE else find_live_owner(profile_home, title)
++
++
++def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
++    """Return the exact Bot Chat tip's lease, including unsupported CLI owners."""
++    from tools.bot_mode_probe import BOT_CHAT_TITLE
++
++    return find_owner_by_title(profile_home, BOT_CHAT_TITLE)
++
++
++def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
++    """Only advertised consumers may receive owner-pinned mailbox deliveries."""
++    from tools.bot_mode_probe import BOT_CHAT_TITLE
++
++    return find_live_owner(profile_home, BOT_CHAT_TITLE)
++
++
++def find_live_owner_for_session(profile_home: Path | str, session_id: str | None) -> dict[str, Any] | None:
++    """The advertised live-delivery owner that ``session_id`` currently IS, if eligible.
++
++    Recognition — not new-message targeting — so it consults EVERY title that may carry the
++    messaging surface in this profile (all declared handoff titles plus the canonical Bot
++    Chat). An already-pinned envelope stays claimable when the profile widens its
++    declaration, and the caller still compares lease, live id and lineage."""
++    if not session_id:
++        return None
++    from tools.bot_mode_probe import messaging_titles
++
++    for title in messaging_titles(profile_home):
++        owner = find_live_owner(profile_home, title)
++        if owner is not None and owner["session_id"] == session_id:
++            return owner
++    return None
++
++
+ def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
+     pinned = {key: owner.get(key) for key in _OWNER_KEYS}
+     if not all(isinstance(value, str) and value for value in pinned.values()):
+@@ -241,9 +297,19 @@ def _matches(home: Path | str, record: dict, owner: dict) -> bool:
+ 
+ 
+ def owner_holds_delivery(profile_home: Path | str, record: dict) -> bool:
+-    """Whether the canonical live owner is still one that could claim ``record``."""
+-    owner = find_canonical_live_owner(profile_home)
+-    return owner is not None and _matches(profile_home, record, owner)
++    """Whether a live owner that could still claim ``record`` is present.
++
++    The record pins the session it was addressed to, so this asks EVERY currently eligible
++    title in the profile (all declared handoff titles plus the canonical Bot Chat) whether
++    it still holds that pinned lease/live id/compression lineage. ``_matches`` is what
++    keeps a message from being held open by a different chat."""
++    from tools.bot_mode_probe import messaging_titles
++
++    for title in messaging_titles(profile_home):
++        owner = find_live_owner(profile_home, title)
++        if owner is not None and _matches(profile_home, record, owner):
++            return True
++    return False
+ 
+ 
+ def claim_pending_delivery(
+diff --git a/tools/bot_mode_dm.py b/tools/bot_mode_dm.py
+index 80a44c70b9..e5c3acf440 100644
+--- a/tools/bot_mode_dm.py
++++ b/tools/bot_mode_dm.py
+@@ -122,16 +122,18 @@ def message_agent_tool_schema() -> dict:
+ 
+ def message_agent_authorized(agent: Any) -> bool:
+     """The ``message_agent`` gate: a protocol-enabled agent whose session is a managed
+-    Bot-Mode canonical Bot Chat. Session-stable, so it is prompt-cache safe to re-evaluate
+-    on every tool-snapshot rebuild. Never raises."""
++    Bot-Mode canonical Bot Chat, or a handoff session this profile declared
++    (``agent.bot_mode_handoff_titles``). Session-stable, so it is prompt-cache safe to
++    re-evaluate on every tool-snapshot rebuild. Never raises."""
+     try:
+         if not getattr(agent, "_bot_mode_protocol", True):
+             return False
+-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
++        from tools.bot_mode_probe import is_bot_mode_managed, session_has_bot_mode
+ 
++        home = _agent_home(agent)
+         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
+         # legacy protocol text gets an empty section but must still get the tool.
+-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
++        return session_has_bot_mode(_session_title(agent), home) and is_bot_mode_managed(home)
+     except Exception:  # pragma: no cover — must never break a turn
+         logger.debug("message_agent_authorized failed", exc_info=True)
+         return False
+@@ -204,13 +206,14 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
+     home = _agent_home(agent)
+     try:
+         from tools.bot_mode_probe import (
+-            BOT_CHAT_TITLE, _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
+-            _roster, is_bot_mode_managed,
++            _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
++            _roster, is_bot_mode_managed, session_has_bot_mode,
+         )
+         from tools.bot_relay import BOT_CHAT_TURN_ARGS, _hermes_cli
+ 
+-        if _session_title(agent) != BOT_CHAT_TITLE:
+-            return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
++        if not session_has_bot_mode(_session_title(agent), home):
++            return _err("message_agent is only available in a Bot Mode 'Bot Chat' session, or in a "
++                        "session this profile allowlists via agent.bot_mode_handoff_titles. "
+                         "This session is not one; do not retry.")
+         if not is_bot_mode_managed(home):
+             return _err("This install is not Bot-Mode-managed (no bot roster); "
+@@ -291,8 +294,59 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
+         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
+                            "machine, or on a registered peer. Pick a name from the roster "
+                            "(roles are listed in your system prompt).")
+-    return _start_delivery([_hermes_cli(), "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
+-                           stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
++    turn_args = _local_turn_args(roster_homes[resolved])
++    if turn_args is None:
++        # The teammate declared a handoff session that has no session of exactly that title:
++        # refuse, rather than deliver into a "<title> #N" sibling or the canonical chat.
++        from tools.bot_mode_probe import delivery_session_title
++
++        return _err(f"@{_handle(resolved)} declares '{delivery_session_title(roster_homes[resolved])}' as its "
++                    "handoff session, but no session with exactly that title exists there, so nothing was "
++                    "sent and nothing was queued.")
++    return _start_delivery([_hermes_cli(), "-p", resolved, *turn_args], content,
++                           f"@{_handle(resolved)}", stdin_file=False, profile_home=roster_homes[resolved],
++                           author=author, **delivery)
++
++
++def _local_turn_args(target_home: Path) -> list[str] | None:
++    """Turn argv for a local teammate delivery: into the teammate's declared handoff
++    session when it declares exactly one (``agent.bot_mode_handoff_titles``), else its
++    canonical Bot Chat. ``None`` = the declared session does not exist, so the caller must
++    refuse rather than deliver somewhere else.
++
++    A declared session is addressed by EXACT session id (``--resume``), never by title:
++    ``-c <title>`` resolves a non-canonical title to its ``"<title> #N"`` sibling when one
++    exists, which would silently deliver the message into a different chat."""
++    from tools.bot_live_delivery import session_id_for_title
++    from tools.bot_mode_probe import BOT_CHAT_TITLE, delivery_session_title
++    from tools.bot_relay import BOT_CHAT_TURN_ARGS
++
++    title = delivery_session_title(target_home)
++    if title == BOT_CHAT_TITLE:
++        return list(BOT_CHAT_TURN_ARGS)
++    session_id = session_id_for_title(target_home, title)
++    if not session_id:
++        return None
++    # Same leading shape (``-p <profile>``) as the Bot Chat lane, so the profile turn lock
++    # and the delivery runner match it unchanged.
++    return ["chat", "--in", "~", "--resume", session_id, "-Q"]
++
++
++def _delivery_live_owner(profile_home: Path) -> dict | None:
++    """The live owner a NEW local delivery may be admitted to: the selected session's own
++    owner, and nothing else — the profile's declared handoff session when it selects one,
++    else the canonical Bot Chat.
++
++    No cross-chat fallback: an envelope pins the session it was written for, so queuing it
++    for the other chat's owner would leave the sender told 'queued' while nobody can ever
++    claim it. When the selected session is simply not open, ``None`` lets the caller fall
++    through to its exact-ID CLI transport."""
++    from tools.bot_live_delivery import declared_live_owner, find_canonical_live_owner
++    from tools.bot_mode_probe import BOT_CHAT_TITLE, delivery_session_title
++
++    if delivery_session_title(profile_home) == BOT_CHAT_TITLE:
++        return find_canonical_live_owner(profile_home)
++    return declared_live_owner(profile_home)
+ 
+ 
+ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
+@@ -487,7 +541,7 @@ def _dm_delivery_id(dm_file: "str | os.PathLike") -> str:
+ 
+ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None) -> dict | None:
+     """Pin intent before admission; retries may inspect, never change transport."""
+-    from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner, read_delivery_result
++    from tools.bot_live_delivery import deliver_to_live_owner, read_delivery_result
+     from utils import fsync_directory
+ 
+     intent: dict[str, Any]
+@@ -496,7 +550,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
+         intent = json.loads(intent_path.read_text(encoding="utf-8-sig"))
+     else:
+         assert profile_home is not None
+-        owner = find_canonical_live_owner(profile_home)
++        owner = _delivery_live_owner(profile_home)
+         if owner is None:
+             return None
+         intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8-sig"),
+@@ -872,14 +926,12 @@ def _agent_home(agent: Any) -> str:
+ 
+ 
+ def _session_title(agent: Any) -> str:
+-    title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+-    if title:
+-        return title
+-    with contextlib.suppress(Exception):
+-        sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+-        if sdb and sid:
+-            return str(sdb.get_session_title(sid) or "").strip()
+-    return ""
++    """The calling session's authoritative title — the shared resolver in
++    :func:`tools.bot_mode_probe.session_title_for` (stored title first; the surface hint
++    only for an unpersisted creation; ``""`` when identity cannot be established)."""
++    from tools.bot_mode_probe import session_title_for
++
++    return session_title_for(agent)
+ 
+ 
+ if __name__ == "__main__":  # pragma: no cover - exercised as a background process
+diff --git a/tools/bot_mode_probe.py b/tools/bot_mode_probe.py
+index 2a7e22cd5b..ed8a0174a5 100644
+--- a/tools/bot_mode_probe.py
++++ b/tools/bot_mode_probe.py
+@@ -15,6 +15,7 @@ from __future__ import annotations
+ import os
+ import re
+ import threading
++import time
+ from pathlib import Path
+ 
+ _PROTOCOL_HEADING = "## Messaging other agents"
+@@ -129,6 +130,108 @@ def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
+     return _swallow(lambda: _any_managed(_hermes_root(_resolve_home(home))), False)
+ 
+ 
++# ── declared handoff sessions (scoped, opt-in) ───────────────────────────────
++# ``agent.bot_mode_handoff_titles`` names EXTRA session titles of THIS profile that
++# carry the Bot Mode messaging surface (protocol section + ``message_agent``) beside
++# the canonical Bot Chat. Profile-scoped and opt-in: a profile that declares nothing
++# keeps the canonical-only gate byte-for-byte. The declaration is an AUTHORIZATION, so
++# it is read from this profile's OWN ``config.yaml`` bytes — never from a merged view
++# (an install-wide managed overlay or a stale last-known-good copy would grant access a
++# profile never declared) — and any read/parse failure yields the empty set, so a
++# damaged config can only ever REMOVE the capability. Titles are compared exactly after
++# stripping, so the canonical title can never be re-declared. Cached briefly per home so
++# the per-turn path stays a dict lookup while a config edit is still adopted without a
++# restart.
++HANDOFF_TITLES_KEY = "bot_mode_handoff_titles"
++_HANDOFF_TTL_SECONDS = 30.0
++_handoff_lock = threading.Lock()
++_handoff_cache: dict[str, tuple[float, frozenset[str]]] = {}
++
++
++def _read_handoff_titles(resolved: str) -> frozenset[str]:
++    def _load() -> frozenset[str]:
++        data = _read_yaml_dict(Path(resolved) / "config.yaml")
++        agent_cfg = data.get("agent") if isinstance(data, dict) else None
++        raw = agent_cfg.get(HANDOFF_TITLES_KEY) if isinstance(agent_cfg, dict) else None
++        if not isinstance(raw, (list, tuple, set)):
++            return frozenset()
++        # Strings only: a YAML number/bool is not a session title, and coercing one
++        # would invent a gate input nobody declared.
++        return frozenset(
++            title for title in (value.strip() for value in raw if isinstance(value, str))
++            if title and title != BOT_CHAT_TITLE
++        )
++
++    return _swallow(_load, frozenset())
++
++
++def handoff_titles(home: str | os.PathLike | None = None) -> frozenset[str]:
++    """Session titles THIS profile explicitly allows to carry the Bot Mode messaging
++    surface beside its canonical Bot Chat. Never raises."""
++    resolved = str(_resolve_home(home))
++    now = time.monotonic()
++    with _handoff_lock:
++        cached = _handoff_cache.get(resolved)
++        if cached is not None and now - cached[0] < _HANDOFF_TTL_SECONDS:
++            return cached[1]
++    titles = _read_handoff_titles(resolved)
++    with _handoff_lock:
++        _handoff_cache[resolved] = (now, titles)
++    return titles
++
++
++def session_has_bot_mode(title: str | None, home: str | os.PathLike | None = None) -> bool:
++    """True when a session carrying ``title`` gets the Bot Mode messaging surface:
++    the canonical Bot Chat, or a title this profile declared as a handoff session."""
++    wanted = str(title or "").strip()
++    if not wanted:
++        return False
++    return wanted == BOT_CHAT_TITLE or wanted in handoff_titles(home)
++
++
++def delivery_session_title(home: str | os.PathLike | None = None) -> str:
++    """The session a NEW local delivery INTO this profile targets: its declared handoff
++    session when exactly one is declared, else the canonical Bot Chat. Two or more
++    declared titles are ambiguous (a DM would have to guess between two inboxes), so the
++    canonical Bot Chat stays the target until the profile narrows to one."""
++    titles = sorted(handoff_titles(home))
++    return titles[0] if len(titles) == 1 else BOT_CHAT_TITLE
++
++
++def messaging_titles(home: str | os.PathLike | None = None) -> list[str]:
++    """EVERY title whose session may carry the messaging surface in this profile: each
++    declared handoff title plus the canonical Bot Chat. Recognition of an already-pinned
++    delivery uses this list — unlike :func:`delivery_session_title`, which picks the target
++    for a NEW message and must stay unambiguous."""
++    return [*sorted(handoff_titles(home)), BOT_CHAT_TITLE]
++
++
++def session_title_for(agent) -> str:
++    """The calling session's AUTHORITATIVE title — one resolver for the gate, the prompt
++    section and the capability refresh.
++
++    Order: this session's STORED title; then, only when no session row exists yet (an
++    unpersisted creation), the ``_session_title_hint`` its surface stamped. A persisted row
++    with no title (cleared/blanked) and a failed read both return ``""`` — unidentified, so
++    callers fail closed instead of inheriting a stale hint."""
++    sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
++    hint = str(getattr(agent, "_session_title_hint", "") or "").strip()
++    if sdb is None or not sid:
++        return hint
++
++    def _resolve() -> str:
++        stored = str(sdb.get_session_title(sid) or "").strip()
++        if stored:
++            return stored
++        get_row = getattr(sdb, "get_session", None)
++        row = get_row(sid) if callable(get_row) else None
++        # No row at all: a genuinely unpersisted creation, where the hint IS the identity.
++        # A row that exists with no title is unidentified — fail closed.
++        return hint if row is None else ""
++
++    return _swallow(_resolve, "")
++
++
+ def _role_line(*parts: str) -> str:
+     """'title — description' from the non-empty parts (either may be absent)."""
+     return " — ".join(p for p in parts if p)
+@@ -418,6 +521,10 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
+ 
+     surface["soul"] = _swallow(_soul, "")
+     surface["skills"] = _swallow(_skills, [])
++    # Declared handoff sessions change the messaging surface (an extra session carries
++    # the roster section and the tool), so a declaration edit must refresh eternal Bot
++    # Chats once, exactly like a roster or peer change.
++    surface["handoff_titles"] = sorted(_swallow(lambda: handoff_titles(resolved), frozenset()))
+     try:
+         roster = _roster(root)
+         surface["roster"] = sorted(n for n, d in roster if _is_bot_managed(d))
+@@ -472,3 +579,5 @@ def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.Path
+ def _reset_cache_for_tests() -> None:
+     with _lock:
+         _cached.clear()
++    with _handoff_lock:
++        _handoff_cache.clear()
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 86634f45f2..9b76e2dd04 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -624,7 +624,9 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred,
+ 
+ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
+     """Run one durable envelope only after local FIFO/continuations yield the idle boundary."""
+-    from tools.bot_live_delivery import claim_pending_delivery, complete_delivery, find_canonical_live_owner, has_mailbox
++    from tools.bot_live_delivery import (
++        claim_pending_delivery, complete_delivery, find_live_owner_for_session, has_mailbox,
++    )
+ 
+     home = _session_home(session)
+     # Most profiles never receive a delivery: without a mailbox there is nothing to claim, and the owner
+@@ -641,7 +643,7 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
+         lease = session.get("active_session_lease")
+         if lease is None or getattr(lease, "released", False):
+             return False
+-        owner = find_canonical_live_owner(home)
++        owner = find_live_owner_for_session(home, session.get("session_key"))
+         if (not owner or owner.get("lease_id") != lease.lease_id
+                 or owner.get("live_session_id") != sid
+                 or owner.get("session_id") != session.get("session_key")):
